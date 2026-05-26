@@ -1,0 +1,272 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/* ---------- OLED ---------- */
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+/* ---------- Motor Pins ---------- */
+#define IN1 26
+#define IN2 27
+#define IN3 14
+#define IN4 12
+#define ENA 25
+#define ENB 33
+
+/* ---------- Ultrasonic ---------- */
+#define TRIG 5
+#define ECHO 18
+
+/* ---------- LEDs ---------- */
+#define LED_SAFE 16
+#define LED_WARN 17
+#define LED_BRAKE 4
+
+/* ---------- RTOS ---------- */
+QueueHandle_t distanceQueue;
+SemaphoreHandle_t brakeSemaphore;
+SemaphoreHandle_t mutex;
+TaskHandle_t MotorHandle;
+TimerHandle_t ledTimer;
+
+/* ---------- Shared ---------- */
+float currentDistance = 0;
+bool brakeStatus = false;
+
+/* ---------- PWM ---------- */
+#define PWM_CH_A 0
+#define PWM_CH_B 1
+
+/* ===================================================== */
+/* ===================== MOTOR TASK ===================== */
+/* ===================================================== */
+void MotorTask(void *pvParameters)
+{
+  while (1)
+  {
+    xSemaphoreTake(mutex, portMAX_DELAY);
+
+    if (!brakeStatus)
+    {
+      if (currentDistance > 30)
+      {
+        ledcWrite(PWM_CH_A, 200);
+        ledcWrite(PWM_CH_B, 200);
+      }
+      else
+      {
+        ledcWrite(PWM_CH_A, 120);
+        ledcWrite(PWM_CH_B, 120);
+      }
+
+      digitalWrite(IN1, HIGH);
+      digitalWrite(IN2, LOW);
+      digitalWrite(IN3, HIGH);
+      digitalWrite(IN4, LOW);
+    }
+
+    xSemaphoreGive(mutex);
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+/* ===================================================== */
+/* ===================== SENSOR TASK ==================== */
+/* ===================================================== */
+void SensorTask(void *pvParameters)
+{
+  while (1)
+  {
+    digitalWrite(TRIG, LOW);
+    delayMicroseconds(2);
+
+    digitalWrite(TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG, LOW);
+
+    long duration = pulseIn(ECHO, HIGH, 30000);
+
+    float distance = duration * 0.034 / 2;
+
+    xQueueSend(distanceQueue, &distance, portMAX_DELAY);
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
+/* ===================================================== */
+/* ==================== DECISION TASK =================== */
+/* ===================================================== */
+void DecisionTask(void *pvParameters)
+{
+  float receivedDistance;
+
+  while (1)
+  {
+    if (xQueueReceive(distanceQueue, &receivedDistance, portMAX_DELAY))
+    {
+      currentDistance = receivedDistance;
+
+      if (receivedDistance < 15)
+      {
+        xSemaphoreGive(brakeSemaphore);
+      }
+      else if (receivedDistance > 25)
+      {
+        xSemaphoreTake(mutex, portMAX_DELAY);
+        brakeStatus = false;
+        xSemaphoreGive(mutex);
+
+        vTaskResume(MotorHandle);
+      }
+    }
+  }
+}
+
+/* ===================================================== */
+/* ===================== BRAKE TASK ===================== */
+/* ===================================================== */
+void BrakeTask(void *pvParameters)
+{
+  while (1)
+  {
+    if (xSemaphoreTake(brakeSemaphore, portMAX_DELAY))
+    {
+      xSemaphoreTake(mutex, portMAX_DELAY);
+
+      brakeStatus = true;
+
+      digitalWrite(IN1, LOW);
+      digitalWrite(IN2, LOW);
+      digitalWrite(IN3, LOW);
+      digitalWrite(IN4, LOW);
+
+      ledcWrite(PWM_CH_A, 0);
+      ledcWrite(PWM_CH_B, 0);
+
+      xSemaphoreGive(mutex);
+
+      vTaskSuspend(MotorHandle);
+    }
+  }
+}
+
+/* ===================================================== */
+/* ==================== DISPLAY TASK ==================== */
+/* ===================================================== */
+void DisplayTask(void *pvParameters)
+{
+  while (1)
+  {
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+
+    display.print("Distance: ");
+    display.println(currentDistance);
+
+    if (currentDistance > 30)
+      display.println("SAFE");
+    else if (currentDistance > 15)
+      display.println("WARNING");
+    else
+      display.println("BRAKE APPLIED");
+
+    display.display();
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+}
+
+/* ===================================================== */
+/* ====================== LED TIMER ===================== */
+/* ===================================================== */
+void ledCallback(TimerHandle_t xTimer)
+{
+  static bool toggle = false;
+  toggle = !toggle;
+
+  if (currentDistance > 30)
+  {
+    digitalWrite(LED_SAFE, HIGH);
+    digitalWrite(LED_WARN, LOW);
+    digitalWrite(LED_BRAKE, LOW);
+  }
+  else if (currentDistance > 15)
+  {
+    digitalWrite(LED_SAFE, LOW);
+    digitalWrite(LED_WARN, toggle);
+    digitalWrite(LED_BRAKE, LOW);
+  }
+  else
+  {
+    digitalWrite(LED_SAFE, LOW);
+    digitalWrite(LED_WARN, LOW);
+    digitalWrite(LED_BRAKE, HIGH);
+  }
+}
+
+/* ===================================================== */
+/* ======================== SETUP ======================= */
+/* ===================================================== */
+void setup()
+{
+  /* Motor */
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  /* PWM */
+  ledcSetup(PWM_CH_A, 1000, 8);
+  ledcSetup(PWM_CH_B, 1000, 8);
+
+  ledcAttachPin(ENA, PWM_CH_A);
+  ledcAttachPin(ENB, PWM_CH_B);
+
+  /* Sensor */
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  /* LEDs */
+  pinMode(LED_SAFE, OUTPUT);
+  pinMode(LED_WARN, OUTPUT);
+  pinMode(LED_BRAKE, OUTPUT);
+
+  /* OLED */
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.println("System Start");
+  display.display();
+
+  /* RTOS objects */
+  distanceQueue = xQueueCreate(5, sizeof(float));
+  brakeSemaphore = xSemaphoreCreateBinary();
+  mutex = xSemaphoreCreateMutex();
+
+  /* Timer */
+  ledTimer = xTimerCreate("LED Timer", pdMS_TO_TICKS(500), pdTRUE, 0, ledCallback);
+  xTimerStart(ledTimer, 0);
+
+  /* Tasks */
+  xTaskCreate(MotorTask, "MotorTask", 2048, NULL, 1, &MotorHandle);
+  xTaskCreate(SensorTask, "SensorTask", 2048, NULL, 1, NULL);
+  xTaskCreate(DecisionTask, "DecisionTask", 2048, NULL, 2, NULL);
+  xTaskCreate(BrakeTask, "BrakeTask", 2048, NULL, 3, NULL);
+  xTaskCreate(DisplayTask, "DisplayTask", 2048, NULL, 1, NULL);
+}
+
+void loop()
+{
+}
